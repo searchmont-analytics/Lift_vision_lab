@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lift Vision Lab V2 · Real footage</title>
+<style>
+body{max-width:900px;margin:2rem auto;padding:0 1rem;font:16px system-ui;color:#17324a;background:#f1f6fa}
+section{background:white;padding:1rem;margin:1rem 0;border-radius:.5rem}
+label{display:inline-block;margin:.3rem .7rem .3rem 0}button,input,select{font:inherit}
+canvas{display:block;width:100%;height:auto;background:#dce8f0}
+td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
+</style>
+<a href="./">Synthetic demo</a>
+<h1>Lift Vision Lab V2</h1>
+<p>Run a pretrained person detector on a local chairlift clip. The browser downloads the model. It processes the selected video on your device.</p>
+<section>
+<label>Local video <input id="file" type="file" accept="video/*"></label><br>
+<label>Direction <select id="direction"><option value="1">Left to right</option><option value="-1">Right to left</option><option value="2">Top to bottom</option><option value="-2">Bottom to top</option></select></label>
+<label>Gate (%) <input id="gate" type="number" min="5" max="95" value="50" step="1" required></label>
+<label>Start (s) <input id="from" type="number" min="0" value="0" step=".1" required></label>
+<label>End (s) <input id="to" type="number" min="0" placeholder="End of clip" step=".1"></label>
+<p>Choose one continuous shot. Align the gate so chair riders cross it and people on the ground stay outside the count region. Optionally drag a rectangle on the preview to restrict detections, or click to reset the region.</p>
+<button id="run" disabled>Analyze clip</button><button id="stop" disabled>Stop</button>
+<p id="status" role="status">Choose a local video to start.</p>
+</section>
+<canvas id="preview" width="800" height="450" aria-label="Frame, detected people, and count gate"></canvas>
+<video id="video" muted playsinline hidden></video>
+<section>
+<h2>Crossing events</h2>
+<p>Click a timestamp to review its sampled frame. A person detection can be a rider or a bystander. Review the events before using the count. Equipment and patrol are unclassified.</p>
+<label>Manual reference count <input id="manual" type="number" min="0" step="1"></label>
+<strong id="total">0 events</strong><button id="csv" disabled>Export CSV</button>
+<table><thead><tr><th>Clip time (s)</th><th>Track</th><th>Confidence</th><th>Review</th></tr></thead><tbody id="rows"></tbody></table>
+</section>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+'use strict';
+const el=id=>document.getElementById(id);
+const video=el('video'), canvas=el('preview'), ctx=canvas.getContext('2d');
+const inputs=['file','direction','gate','from','to'].map(el);
+let objectUrl, model, region=[0,0,1,1], drag, events=[], running=false, cancel=false, reviewing=false;
+const step=.2;
+const status=message=>{el('status').textContent=message;};
+function configuration(){
+  const d=Number(el('direction').value), gate=el('gate').valueAsNumber/100;
+  return {horizontal:Math.abs(d)===1, sign:Math.sign(d), gate};
+}
+function seek(time){
+  if(video.readyState>=2 && !video.seeking && Math.abs(video.currentTime-time)<.0001) return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const timeout=setTimeout(()=>finish(new Error('Video seek timed out.')),8000);
+    function finish(error){
+      clearTimeout(timeout);
+      video.removeEventListener('seeked',ready);
+      video.removeEventListener('error',fail);
+      if(error) reject(error); else resolve();
+    }
+    function ready(){finish();}
+    function fail(){finish(new Error('Could not decode the video.'));}
+    video.addEventListener('seeked',ready);
+    video.addEventListener('error',fail);
+    try{video.currentTime=time;}catch(error){finish(error);}
+  });
+}
+function paint(config=configuration(), detections=[]){
+  const w=canvas.width,h=canvas.height;
+  if(video.readyState>=2)ctx.drawImage(video,0,0,w,h);
+  const [l,t,r,b]=region;
+  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.strokeRect(l*w,t*h,(r-l)*w,(b-t)*h);
+  ctx.strokeStyle='#00e4ff';ctx.beginPath();
+  if(config.horizontal){ctx.moveTo(config.gate*w,0);ctx.lineTo(config.gate*w,h);}
+  else{ctx.moveTo(0,config.gate*h);ctx.lineTo(w,config.gate*h);}
+  ctx.stroke();
+  ctx.font='16px system-ui';ctx.strokeStyle='#55ff9d';ctx.fillStyle='#55ff9d';
+  for(const {bbox,score,id} of detections){
+    const [x,y,bw,bh]=bbox;
+    ctx.strokeRect(x,y,bw,bh);ctx.fillText('#'+id+' '+Math.round(score*100)+'%',x,Math.max(16,y-4));
+  }
+}
+function locks(){
+  for(const input of inputs)input.disabled=running||reviewing;
+  el('run').disabled=running||reviewing||video.readyState<2;
+  el('stop').disabled=!running;
+}
+function clearEvents(){events=[];el('rows').replaceChildren();summary();}
+el('file').onchange=()=>{
+  const file=el('file').files[0];if(!file)return;
+  if(objectUrl)URL.revokeObjectURL(objectUrl);
+  region=[0,0,1,1];clearEvents();el('run').disabled=true;
+  status('Opening local video…');
+  video.src=objectUrl=URL.createObjectURL(file);
+};
+video.onloadeddata=()=>{
+  const scale=Math.min(1,960/Math.max(video.videoWidth,video.videoHeight));
+  canvas.width=Math.round(video.videoWidth*scale);canvas.height=Math.round(video.videoHeight*scale);
+  el('from').value=0;el('to').value='';paint();locks();
+  status('Clip ready · '+video.duration.toFixed(1)+' seconds');
+};
+video.onerror=()=>{el('run').disabled=true;status('Could not open this video. Try a browser-playable MP4.');};
+for(const id of ['direction','gate'])el(id).oninput=()=>paint();
+function point(e){
+  const bounds=canvas.getBoundingClientRect(),clamp=x=>Math.max(0,Math.min(1,x));
+  return [clamp((e.clientX-bounds.left)/bounds.width),clamp((e.clientY-bounds.top)/bounds.height)];
+}
+canvas.onpointerdown=e=>{if(!running&&!reviewing&&video.readyState>=2){drag=point(e);canvas.setPointerCapture(e.pointerId);}};
+canvas.onpointercancel=()=>{drag=null;};
+canvas.onpointerup=e=>{
+  if(!drag||running||reviewing)return;
+  const [x,y]=point(e),[a,b]=drag;
+  region=Math.abs(x-a)>.025&&Math.abs(y-b)>.025?
+    [Math.min(x,a),Math.min(y,b),Math.max(x,a),Math.max(y,b)]:[0,0,1,1];
+  drag=null;paint();
+};
+function summary(){
+  const accepted=events.filter(e=>e.accepted).length, manual=el('manual').valueAsNumber;
+  el('total').textContent=accepted+' accepted / '+events.length+' detected'+
+    (Number.isInteger(manual)&&manual>=0?' · difference from manual '+(accepted-manual):'');
+  el('csv').disabled=!events.length;
+}
+el('manual').oninput=summary;
+function append(event){
+  events.push(event);summary();
+  const row=el('rows').insertRow(), button=document.createElement('button');
+  button.textContent=event.time.toFixed(2);
+  button.onclick=async()=>{
+    if(running||reviewing)return;
+    reviewing=true;locks();
+    try{await seek(event.frameTime);paint(event.config,event.detections);}
+    catch(error){status(error.message);}
+    finally{reviewing=false;locks();}
+  };
+  row.insertCell().append(button);
+  row.insertCell().textContent=event.id;
+  row.insertCell().textContent=Math.round(event.score*100)+'%';
+  const review=document.createElement('input');
+  review.type='checkbox';review.checked=true;review.setAttribute('aria-label','Accept track '+event.id);
+  review.onchange=()=>{event.accepted=review.checked;summary();};
+  row.insertCell().append(review);
+}
+function makeTracker(config){
+  let tracks=[],nextId=1;
+  return function update(detections,t){
+    tracks=tracks.filter(track=>t-track.t<=.8);
+    const signed=d=>config.sign*((config.horizontal?d.x:d.y)-config.gate);
+    const pairs=[];
+    for(const track of tracks)for(const d of detections){
+      const gap=t-track.t;
+      const distance=Math.hypot(d.x-track.x-track.vx*gap,d.y-track.y-track.vy*gap);
+      if(distance<.045+.09*gap) pairs.push({track,d,distance});
+    }
+    pairs.sort((a,b)=>a.distance-b.distance);
+    const matched=new Set(),used=new Set(),crossings=[];
+    for(const {track,d} of pairs){
+      if(matched.has(track)||used.has(d))continue;
+      matched.add(track);used.add(d);track.hits++;d.id=track.id;
+      const before=signed(track),after=signed(d),dt=t-track.t;
+      if(after<-.015)track.armed=true;
+      if(track.armed&&before<0&&after>=0)track.cross=t-dt*after/(after-before);
+      if(after<0)track.cross=null;
+      if(track.cross!==null&&after>=.01&&track.hits>=3&&!track.counted){
+        crossings.push({id:track.id,time:track.cross,frameTime:t,score:d.score,accepted:true});
+        track.counted=true;
+      }
+      track.vx=.4*track.vx+.6*(d.x-track.x)/dt;
+      track.vy=.4*track.vy+.6*(d.y-track.y)/dt;
+      Object.assign(track,d,{t});
+    }
+    for(const d of detections)if(!used.has(d)){
+      d.id=nextId++;
+      tracks.push({...d,t,hits:1,vx:0,vy:0,armed:signed(d)<-.015,cross:null,counted:false});
+    }
+    return crossings;
+  };
+}
+el('stop').onclick=()=>{cancel=true;status('Stopping after the current frame…');};
+el('run').onclick=async()=>{
+  if(!inputs.slice(1).every(input=>input.reportValidity()))return;
+  const config=configuration(), start=el('from').valueAsNumber;
+  const end=Math.min(el('to').valueAsNumber||video.duration,video.duration);
+  if(end<=start){status('Choose an end time after the start and within the clip.');return;}
+  const update=makeTracker(config);
+  running=true;cancel=false;locks();clearEvents();
+  try{
+    if(!window.cocoSsd)throw new Error('The model library did not load. Check your connection and reload.');
+    if(!model){status('Downloading and loading the recognition model…');model=await cocoSsd.load();}
+    for(let i=0;!cancel&&start+i*step<end;i++){
+      const t=start+i*step;
+      await seek(t);
+      if(cancel)break;
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      const predictions=await model.detect(canvas,60,.35);
+      if(cancel)break;
+      const [l,top,r,b]=region;
+      const detections=predictions.filter(p=>p.class==='person').map(p=>({
+        ...p,x:(p.bbox[0]+p.bbox[2]/2)/canvas.width,y:(p.bbox[1]+p.bbox[3]/2)/canvas.height
+      })).filter(p=>p.x>=l&&p.x<=r&&p.y>=top&&p.y<=b);
+      for(const event of update(detections,t))append({...event,config,detections});
+      paint(config,detections);
+      status('Analyzing '+t.toFixed(1)+' / '+end.toFixed(1)+' s · '+detections.length+' people in region');
+    }
+    status(cancel?'Analysis stopped. The events below are partial.':'Analysis complete. Review the crossing events below.');
+  }catch(error){status('Analysis stopped · '+error.message);}
+  finally{running=false;locks();}
+};
+el('csv').onclick=()=>{
+  const body=['track,clip_seconds,sampled_frame_seconds,confidence,accepted',
+    ...events.map(e=>[e.id,e.time.toFixed(3),e.frameTime.toFixed(3),e.score.toFixed(3),e.accepted].join(','))].join('\r\n');
+  const url=URL.createObjectURL(new Blob([body],{type:'text/csv'}));
+  const link=document.createElement('a');link.href=url;link.download='lift-v2-events.csv';link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+</script>
+</html>
