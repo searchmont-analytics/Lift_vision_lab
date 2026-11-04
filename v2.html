@@ -15,19 +15,20 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 <p>Run a pretrained person detector on a local chairlift clip. The browser downloads the model. It processes the selected video on your device.</p>
 <section>
 <label>Local video <input id="file" type="file" accept="video/*"></label><br>
-<label>Direction <select id="direction"><option value="1">Left to right</option><option value="-1">Right to left</option><option value="2">Top to bottom</option><option value="-2">Bottom to top</option></select></label>
-<label>Gate (%) <input id="gate" type="number" min="5" max="95" value="50" step="1" required></label>
+<label>Count <select id="mode"><option value="appearance">Each person in view</option><option value="gate">Gate crossings</option></select></label>
+<span id="gateControls" hidden><label>Direction <select id="direction"><option value="1">Left to right</option><option value="-1">Right to left</option><option value="2">Top to bottom</option><option value="-2">Bottom to top</option></select></label>
+<label>Gate (%) <input id="gate" type="number" min="5" max="95" value="50" step="1" required></label></span>
 <label>Start (s) <input id="from" type="number" min="0" value="0" step=".1" required></label>
 <label>End (s) <input id="to" type="number" min="0" placeholder="End of clip" step=".1"></label>
-<p>Choose one continuous shot. Align the gate so chair riders cross it and people on the ground stay outside the count region. Optionally drag a rectangle on the preview to restrict detections, or click to reset the region.</p>
+<p>Choose one continuous shot. Each person in view counts a track once after three detections. Optionally drag a rectangle around the off-ramp to exclude people outside it, or click the preview to reset the region.</p>
 <button id="run" disabled>Analyze clip</button><button id="stop" disabled>Stop</button>
 <p id="status" role="status">Choose a local video to start.</p>
 </section>
 <canvas id="preview" width="800" height="450" aria-label="Frame, detected people, and count gate"></canvas>
 <video id="video" muted playsinline hidden></video>
 <section>
-<h2>Crossing events</h2>
-<p>Click a timestamp to review its sampled frame. A person detection can be a rider or a bystander. Review the events before using the count. Equipment and patrol are unclassified.</p>
+<h2>Counted people</h2>
+<p>Click a timestamp to review its sampled frame. A long occlusion or re-entry can create a second track for the same person. A person detection can be a rider or a bystander. Review the events before using the count. Equipment and patrol are unclassified.</p>
 <label>Manual reference count <input id="manual" type="number" min="0" step="1"></label>
 <strong id="total">0 events</strong><button id="csv" disabled>Export CSV</button>
 <table><thead><tr><th>Clip time (s)</th><th>Track</th><th>Confidence</th><th>Review</th></tr></thead><tbody id="rows"></tbody></table>
@@ -38,13 +39,13 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 'use strict';
 const el=id=>document.getElementById(id);
 const video=el('video'), canvas=el('preview'), ctx=canvas.getContext('2d');
-const inputs=['file','direction','gate','from','to'].map(el);
+const inputs=['file','mode','direction','gate','from','to'].map(el);
 let objectUrl, model, region=[0,0,1,1], drag, events=[], running=false, cancel=false, reviewing=false;
 const step=.2;
 const status=message=>{el('status').textContent=message;};
 function configuration(){
   const d=Number(el('direction').value), gate=el('gate').valueAsNumber/100;
-  return {horizontal:Math.abs(d)===1, sign:Math.sign(d), gate};
+  return {mode:el('mode').value,horizontal:Math.abs(d)===1, sign:Math.sign(d), gate};
 }
 function seek(time){
   if(video.readyState>=2 && !video.seeking && Math.abs(video.currentTime-time)<.0001) return Promise.resolve();
@@ -69,8 +70,10 @@ function paint(config=configuration(), detections=[]){
   const [l,t,r,b]=region;
   ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.strokeRect(l*w,t*h,(r-l)*w,(b-t)*h);
   ctx.strokeStyle='#00e4ff';ctx.beginPath();
-  if(config.horizontal){ctx.moveTo(config.gate*w,0);ctx.lineTo(config.gate*w,h);}
-  else{ctx.moveTo(0,config.gate*h);ctx.lineTo(w,config.gate*h);}
+  if(config.mode==='gate'){
+    if(config.horizontal){ctx.moveTo(config.gate*w,0);ctx.lineTo(config.gate*w,h);}
+    else{ctx.moveTo(0,config.gate*h);ctx.lineTo(w,config.gate*h);}
+  }
   ctx.stroke();
   ctx.font='16px system-ui';ctx.strokeStyle='#55ff9d';ctx.fillStyle='#55ff9d';
   for(const {bbox,score,id} of detections){
@@ -99,6 +102,10 @@ video.onloadeddata=()=>{
 };
 video.onerror=()=>{el('run').disabled=true;status('Could not open this video. Try a browser-playable MP4.');};
 for(const id of ['direction','gate'])el(id).oninput=()=>paint();
+el('mode').onchange=()=>{
+  el('gateControls').hidden=el('mode').value!=='gate';
+  paint();
+};
 function point(e){
   const bounds=canvas.getBoundingClientRect(),clamp=x=>Math.max(0,Math.min(1,x));
   return [clamp((e.clientX-bounds.left)/bounds.width),clamp((e.clientY-bounds.top)/bounds.height)];
@@ -158,8 +165,10 @@ function makeTracker(config){
       if(after<-.015)track.armed=true;
       if(track.armed&&before<0&&after>=0)track.cross=t-dt*after/(after-before);
       if(after<0)track.cross=null;
-      if(track.cross!==null&&after>=.01&&track.hits>=3&&!track.counted){
-        crossings.push({id:track.id,time:track.cross,frameTime:t,score:d.score,accepted:true});
+      const eventTime=config.mode==='appearance'?track.firstTime:track.cross;
+      const eligible=config.mode==='appearance'||after>=.01;
+      if(eligible&&eventTime!==null&&track.hits>=3&&!track.counted){
+        crossings.push({id:track.id,time:eventTime,frameTime:t,score:d.score,accepted:true});
         track.counted=true;
       }
       track.vx=.4*track.vx+.6*(d.x-track.x)/dt;
@@ -168,15 +177,17 @@ function makeTracker(config){
     }
     for(const d of detections)if(!used.has(d)){
       d.id=nextId++;
-      tracks.push({...d,t,hits:1,vx:0,vy:0,armed:signed(d)<-.015,cross:null,counted:false});
+      tracks.push({...d,t,firstTime:t,hits:1,vx:0,vy:0,armed:signed(d)<-.015,cross:null,counted:false});
     }
     return crossings;
   };
 }
 el('stop').onclick=()=>{cancel=true;status('Stopping after the current frame…');};
 el('run').onclick=async()=>{
-  if(!inputs.slice(1).every(input=>input.reportValidity()))return;
-  const config=configuration(), start=el('from').valueAsNumber;
+  const config=configuration();
+  const checked=config.mode==='gate'?['gate','from','to']:['from','to'];
+  if(!checked.every(id=>el(id).reportValidity()))return;
+  const start=el('from').valueAsNumber;
   const end=Math.min(el('to').valueAsNumber||video.duration,video.duration);
   if(end<=start){status('Choose an end time after the start and within the clip.');return;}
   const update=makeTracker(config);
@@ -199,13 +210,13 @@ el('run').onclick=async()=>{
       paint(config,detections);
       status('Analyzing '+t.toFixed(1)+' / '+end.toFixed(1)+' s · '+detections.length+' people in region');
     }
-    status(cancel?'Analysis stopped. The events below are partial.':'Analysis complete. Review the crossing events below.');
+    status(cancel?'Analysis stopped. The events below are partial.':'Analysis complete. Review the counted tracks below.');
   }catch(error){status('Analysis stopped · '+error.message);}
   finally{running=false;locks();}
 };
 el('csv').onclick=()=>{
-  const body=['track,clip_seconds,sampled_frame_seconds,confidence,accepted',
-    ...events.map(e=>[e.id,e.time.toFixed(3),e.frameTime.toFixed(3),e.score.toFixed(3),e.accepted].join(','))].join('\r\n');
+  const body=['track,clip_seconds,sampled_frame_seconds,confidence,accepted,count_mode',
+    ...events.map(e=>[e.id,e.time.toFixed(3),e.frameTime.toFixed(3),e.score.toFixed(3),e.accepted,e.config.mode].join(','))].join('\r\n');
   const url=URL.createObjectURL(new Blob([body],{type:'text/csv'}));
   const link=document.createElement('a');link.href=url;link.download='lift-v2-events.csv';link.click();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
