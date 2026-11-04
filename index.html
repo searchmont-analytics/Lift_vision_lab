@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lift Vision Lab</title>
+<style>
+body{margin:2rem auto;padding:0 1rem;max-width:1050px;font:16px system-ui;color:#17324a;background:#f1f6fa}button,input,select{font:inherit;margin:.25rem}button{padding:.45rem .75rem}canvas{width:100%;height:auto;border:1px solid #839caf;background:white}section{background:white;padding:1rem;margin:1rem 0;border-radius:.5rem}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.4rem;border-bottom:1px solid #ddd}small{display:block} .scroll{max-height:24rem;overflow:auto}h1,h2{margin:.25rem 0 .65rem}
+</style>
+<h1>Lift Vision Lab</h1>
+<p>A fixed camera counts occupied seats on uphill chairs as they cross a departure line. The built-in clip is synthetic. A local clip can exercise the same experimental pixel detector.</p>
+<section>
+<label>Scenario <select id="scenario"><option value="baseline">Baseline</option><option value="stress">Snow, occlusion and low contrast</option></select></label>
+<button id="play">Play sample</button><button id="run">Run sample to end</button><button id="pause">Pause</button><br>
+<label>Local clip <input id="file" type="file" accept="video/*"></label>
+<label>Recording start (optional, ISO 8601 with offset) <input id="start" size="29" placeholder="2026-11-04T09:00:00-05:00"></label>
+<small>Local clips play from the beginning. Use an already cropped, stationary shot with uphill travel left to right. For video only, drag across the image vertically before opening the clip to set the upper and lower analysis bounds. The crossing gate is at 50% width.</small>
+</section>
+<canvas id="view" width="480" height="220" aria-label="Camera view and counting overlay"></canvas>
+<video id="video" hidden muted playsinline></video>
+<section><h2>Run summary</h2><p id="status" role="status"></p><div id="metrics"></div><button id="eventsCsv">Download events CSV</button><button id="seriesCsv">Download time-series CSV</button><button id="truthCsv">Download sample truth CSV</button></section>
+<section><h2>Ten-second time series</h2><div id="series"></div></section>
+<section><h2>Event audit</h2><p>Review equipment and patrol cues, or reject a false count. Select a sample event time to inspect its crossing frame. The CSV keeps original and reviewed values.</p><div class="scroll"><table><thead><tr><th>Time (s)</th><th>Track</th><th>Equipment</th><th>Patrol cue</th><th>Disposition</th></tr></thead><tbody id="audit"></tbody></table></div></section>
+<script>
+'use strict';
+const el = id => document.getElementById(id);
+const view = el('view'), ctx = view.getContext('2d');
+const raw = document.createElement('canvas');
+const W = raw.width = view.width, H = raw.height = view.height;
+const pixels = raw.getContext('2d', {willReadFrequently:true});
+const gate = W / 2, fps = 12, duration = 36;
+const categories = ['skier','snowboarder','adaptive','unknown'];
+const chairs = [
+  {time:4, seats:['skier','snowboarder','adaptive']},
+  {time:9, seats:[null,'skier','unknown']},
+  {time:14, seats:[]},
+  {time:19, seats:['snowboarder',null,'skier']},
+  {time:24, seats:['adaptive','skier','snowboarder']},
+  {time:30, seats:['unknown','snowboarder',null]}
+];
+const lanes = [72,123,174];
+const truth = chairs.flatMap((chair, i) => chair.seats.flatMap((equipment, seat) =>
+  equipment ? [{time:chair.time, y:lanes[seat]+2, equipment, patrol:i===1&&seat===1 || i===4&&seat===2}] : []));
+let events=[], tracks=[], nextId=1, frame=0, timer, mode='sample', scenario='baseline';
+let clipBounds=[0,H], dragY, clipUrl, generation=0, lastTime=-1, captureStart='';
+
+function sample(t) {
+  pixels.fillStyle='#f0f6fb'; pixels.fillRect(0,0,W,H);
+  pixels.fillStyle='#dceaf5';
+  for(let y=30;y<H;y+=36) pixels.fillRect(0,y,W,2);
+  for (const chair of chairs) {
+    const x=Math.round(gate+42*(t-chair.time));
+    pixels.fillStyle='#bacbd9'; pixels.fillRect(x-17,49,34,145);
+    for (const y of lanes) {
+      pixels.fillStyle='#a5b8c9'; pixels.fillRect(x-26,y+18,52,3);
+    }
+  }
+  for(const [i,rider] of truth.entries()){
+    const x=Math.round(gate+42*(t-rider.time)), y=rider.y-2;
+    if(scenario==='stress' && i===4 && Math.abs(t-rider.time)<0.9) continue;
+    pixels.fillStyle=scenario==='stress' && i===9 ? '#b4c4d0' : rider.patrol ? '#ae292e' : '#263851';
+    if(rider.equipment==='adaptive'){
+      pixels.fillRect(x-11,y-2,23,12);
+      pixels.fillRect(x-5,y-8,10,7);
+    } else {
+      pixels.fillRect(x-7,y-7,15,17);
+      pixels.fillRect(x-4,y-15,9,8);
+    }
+    pixels.fillStyle=scenario==='stress' && i===9 ? '#b4c4d0' : '#263851';
+    if(rider.equipment==='skier'){
+      pixels.fillRect(x-11,y+9,4,7); pixels.fillRect(x+8,y+9,4,7);
+      pixels.fillRect(x-7,y+9,2,2); pixels.fillRect(x+6,y+9,2,2);
+    }
+    if(rider.equipment==='snowboarder') pixels.fillRect(x-15,y+9,31,6);
+    if(rider.equipment==='adaptive') pixels.fillRect(x-12,y+9,25,4);
+  }
+  if(scenario==='stress'){
+    pixels.fillStyle='#fff';
+    for(let i=0;i<145;i++) pixels.fillRect((i*137+Math.floor(t*70))%W,(i*89+Math.floor(t*95))%H,2,2);
+  }
+}
+
+function detect(){
+  const rgba=pixels.getImageData(0,0,W,H).data;
+  const mask=new Uint8Array(W*H);
+  const [lo,hi]=mode==='sample'?[45,196]:clipBounds;
+  for(let i=lo*W;i<hi*W;i++){
+    const p=i*4;
+    mask[i]=.213*rgba[p]+.715*rgba[p+1]+.072*rgba[p+2]<125;
+  }
+  const found=[], queue=new Int32Array(W*H);
+  for(let seed=lo*W;seed<hi*W;seed++){
+    if(!mask[seed]) continue;
+    let n=1,minX=W,maxX=0,minY=H,maxY=0,red=0;
+    queue[0]=seed; mask[seed]=0;
+    for(let k=0;k<n;k++){
+      const i=queue[k],x=i%W,y=Math.floor(i/W),p=i*4;
+      minX=Math.min(minX,x); maxX=Math.max(maxX,x);
+      minY=Math.min(minY,y); maxY=Math.max(maxY,y);
+      if(rgba[p]>115 && rgba[p]>1.8*rgba[p+1] && rgba[p]>1.6*rgba[p+2]) red++;
+      for(const j of [x>0?i-1:-1,x<W-1?i+1:-1,i-W,i+W]){
+        if(mask[j]){mask[j]=0;queue[n++]=j;}
+      }
+    }
+    const w=maxX-minX+1,h=maxY-minY+1;
+    if(n<105||n>2300||h<16||h>63||w<8||w>65) continue;
+    let equipment='unknown';
+    if(mode==='sample'){
+      if(w/h>1.08) equipment='adaptive';
+      else if(w>=28) equipment='snowboarder';
+      else if(w>=21) equipment='skier';
+    }
+    found.push({x:(minX+maxX)/2,y:(minY+maxY)/2,w,h,equipment,
+      patrol:mode==='sample'?(red/n>.28?'cue':'none'):'unknown'});
+  }
+  return found;
+}
+
+function update(detections,t){
+  tracks=tracks.filter(track=>t-track.t<=.85);
+  const pairs=[];
+  for(const track of tracks){
+    for(const d of detections){
+      const dx=d.x-track.x-track.v*(t-track.t),dy=d.y-track.y;
+      if(Math.abs(dx)<28&&Math.abs(dy)<17) pairs.push({track,d,cost:Math.hypot(dx,2*dy)});
+    }
+  }
+  pairs.sort((a,b)=>a.cost-b.cost);
+  const used=new Set(), matched=new Set();
+  for(const {track,d} of pairs){
+    if(used.has(d)||matched.has(track)) continue;
+    used.add(d); matched.add(track);
+    track.hits++;
+    track.samples.push(d);
+    if(track.samples.length>7) track.samples.shift();
+    if(d.x<gate-8) track.armed=true;
+    if(track.x<gate&&d.x>=gate&&track.armed)
+      track.cross=t-(t-track.t)*(d.x-gate)/(d.x-track.x);
+    if(d.x<gate) track.cross=null;
+    if(track.cross!=null&&d.x>=gate+5&&track.hits>=3&&!track.counted){
+      const votes=key=>{
+        const values=track.samples.map(s=>s[key]);
+        const winner=values.find(v=>values.filter(value=>value===v).length>values.length/2);
+        return winner??'unknown';
+      };
+      const equipment=votes('equipment'),patrol=votes('patrol');
+      events.push({id:track.id,time:track.cross,y:d.y,equipment,patrol,
+        reviewedEquipment:equipment,reviewedPatrol:patrol,accepted:true});
+      track.counted=true;
+    }
+    track.v=.55*track.v+.45*(d.x-track.x)/(t-track.t);
+    Object.assign(track,d,{t});
+  }
+  for(const d of detections) if(!used.has(d))
+    tracks.push({...d,id:nextId++,t,v:0,hits:1,armed:d.x<gate-8,cross:null,counted:false,samples:[d]});
+}
+
+function draw(detections=[]){
+  ctx.drawImage(raw,0,0);
+  ctx.strokeStyle='#007b89'; ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(gate,0);ctx.lineTo(gate,H);
+  if(mode==='video'){
+    for(const y of clipBounds){ctx.moveTo(0,y);ctx.lineTo(W,y);}
+  }
+  ctx.stroke();
+  ctx.strokeStyle='#017049';ctx.fillStyle='#005736';ctx.font='10px system-ui';
+  for(const d of detections){
+    ctx.strokeRect(d.x-d.w/2,d.y-d.h/2,d.w,d.h);
+    ctx.fillText(d.equipment,d.x-d.w/2,d.y-d.h/2-3);
+  }
+}
+
+function bins(){
+  const rows=Array.from({length:Math.max(1,Math.ceil((lastTime+.001)/10))},(_,i)=>
+    ({start:i*10,total:0,skier:0,snowboarder:0,adaptive:0,unknown:0,patrol:0}));
+  for(const event of events.filter(e=>e.accepted)){
+    const row=rows[Math.floor(event.time/10)];
+    row.total++;row[event.reviewedEquipment]++;row.patrol+=event.reviewedPatrol==='cue';
+  }
+  return rows;
+}
+
+function evaluate(){
+  const eligible=truth.filter(r=>r.time<=lastTime-.5);
+  const observed=events.filter(e=>e.time<=lastTime-.5);
+  const candidates=[];
+  for(const a of observed) for(const b of eligible)
+    if(Math.abs(a.time-b.time)<=.5&&Math.abs(a.y-b.y)<=18)
+      candidates.push({a,b,delta:Math.abs(a.time-b.time)});
+  candidates.sort((a,b)=>a.delta-b.delta);
+  const seen=new Set(), matched=new Set();
+  let correct=0, patrolTP=0, patrolFP=0, patrolFN=0, timing=0;
+  for(const {a,b,delta} of candidates){
+    if(seen.has(a)||matched.has(b)) continue;
+    seen.add(a);matched.add(b);timing+=delta;
+    correct+=a.equipment===b.equipment;
+    patrolTP+=a.patrol==='cue'&&b.patrol;
+    patrolFP+=a.patrol==='cue'&&!b.patrol;
+    patrolFN+=a.patrol!=='cue'&&b.patrol;
+  }
+  const tp=matched.size, ratio=(a,b)=>b?(100*a/b).toFixed(1)+'%':'—';
+  return 'Raw sample score · TP '+tp+' · FP '+(observed.length-tp)+' · FN '+(eligible.length-tp)+
+    ' · precision '+ratio(tp,observed.length)+' · recall '+ratio(tp,eligible.length)+
+    ' · equipment agreement '+ratio(correct,tp)+' · patrol cue TP/FP/FN on matches '+[patrolTP,patrolFP,patrolFN].join('/')+
+    ' · matched timing MAE '+(tp?(timing/tp).toFixed(3)+' s':'—');
+}
+
+function render(){
+  el('status').textContent=(mode==='sample'?'Synthetic '+scenario:'Local clip')+
+    ' · '+Math.max(0,lastTime).toFixed(2)+' s processed · '+events.filter(e=>e.accepted).length+
+    ' accepted / '+events.length+' detected'+(captureStart?' · '+captureStart:'');
+  el('metrics').textContent=mode==='sample'?evaluate():'Equipment and patrol require manual review on local clips.';
+  el('truthCsv').disabled=mode!=='sample';
+  const rows=bins();
+  el('series').innerHTML='<table><thead><tr><th>Seconds</th><th>Total</th><th>Skier</th><th>Board</th><th>Adaptive</th><th>Unknown</th><th>Patrol cue</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr><td>'+r.start+'–'+(r.start+10)+'</td>'+[r.total,r.skier,r.snowboarder,r.adaptive,r.unknown,r.patrol].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+  while(el('audit').children.length<events.length) appendAudit(events[el('audit').children.length]);
+}
+
+function appendAudit(event){
+  const row=el('audit').insertRow(), time=row.insertCell();
+  if(mode==='sample'){
+    const button=document.createElement('button');
+    button.textContent=event.time.toFixed(2);
+    button.onclick=()=>{stop();sample(event.time);draw(detect());};
+    time.append(button);
+  } else time.textContent=event.time.toFixed(2);
+  row.insertCell().textContent=event.id;
+  for(const [key,options] of [
+    ['reviewedEquipment',categories],['reviewedPatrol',['cue','none','unknown']],['accepted',['true','false']]
+  ]){
+    const select=document.createElement('select');
+    select.setAttribute('aria-label',key+' for track '+event.id);
+    for(const option of options) select.add(new Option(option==='true'?'Accept':option==='false'?'Reject':option,option));
+    select.value=String(event[key]);
+    select.onchange=()=>{event[key]=key==='accepted'?select.value==='true':select.value;render();};
+    row.insertCell().append(select);
+  }
+}
+
+function stop(){clearInterval(timer);timer=null;el('video').pause();}
+function reset(source){
+  stop();generation++;mode=source;lastTime=-1;events=[];tracks=[];nextId=1;frame=0;
+  el('audit').replaceChildren();
+  scenario=el('scenario').value;
+  const value=el('start').value.trim();
+  captureStart=/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value)&&Number.isFinite(Date.parse(value))?value:'';
+  el('start').setCustomValidity(value&&!captureStart?'Use ISO 8601 with an explicit offset.':'');
+  el('start').reportValidity();
+}
+function sampleStep(paint){
+  lastTime=frame++/fps;
+  sample(lastTime);
+  const detections=detect();update(detections,lastTime);
+  if(paint){draw(detections);render();}
+}
+el('play').onclick=()=>{reset('sample');sampleStep(true);timer=setInterval(()=>{
+  sampleStep(true);if(frame>duration*fps) stop();
+},1000/fps);};
+el('run').onclick=()=>{reset('sample');while(frame<duration*fps) sampleStep(false);sampleStep(true);};
+el('pause').onclick=stop;
+view.onpointerdown=e=>{dragY=e.offsetY/view.clientHeight*H;view.setPointerCapture(e.pointerId);};
+view.onpointerup=e=>{
+  if(dragY==null)return;
+  const y=e.offsetY/view.clientHeight*H;
+  if(Math.abs(y-dragY)>8) clipBounds=[Math.max(0,Math.floor(Math.min(y,dragY))),Math.min(H,Math.ceil(Math.max(y,dragY)))];
+  dragY=null;
+  el('status').textContent='Next local clip analysis bounds · '+clipBounds.join('–')+' px';
+};
+el('file').onchange=async e=>{
+  const file=e.target.files[0]; if(!file)return;
+  e.target.value='';
+  reset('video');
+  const id=generation, video=el('video');
+  if(clipUrl) URL.revokeObjectURL(clipUrl);
+  video.src=clipUrl=URL.createObjectURL(file);
+  render();
+  try{
+    await video.play();
+    if(id!==generation)return;
+    const step=(_now,metadata)=>{
+      if(id!==generation||video.paused||video.ended)return;
+      const t=metadata?.mediaTime??video.currentTime;
+      if(t>lastTime){
+        pixels.drawImage(video,0,0,W,H);
+        lastTime=t;const detections=detect();update(detections,t);draw(detections);render();
+      }
+      schedule();
+    };
+    const schedule=()=>video.requestVideoFrameCallback?video.requestVideoFrameCallback(step):requestAnimationFrame(step);
+    schedule();
+  }catch(err){if(id===generation)el('status').textContent='Could not play this clip. '+err.message;}
+};
+function download(name,rows){
+  const body=rows.map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');
+  const url=URL.createObjectURL(new Blob([body],{type:'text/csv;charset=utf-8'}));
+  const link=document.createElement('a');link.href=url;link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+const timestamp=t=>captureStart?new Date(Date.parse(captureStart)+t*1000).toISOString():'';
+el('eventsCsv').onclick=()=>download('lift-events.csv',[
+  ['source','track_id','seconds','utc','y_px','equipment_raw','patrol_raw','equipment_review','patrol_review','accepted'],
+  ...events.map(e=>[mode==='sample'?scenario:mode,e.id,e.time.toFixed(3),timestamp(e.time),e.y,e.equipment,e.patrol,e.reviewedEquipment,e.reviewedPatrol,e.accepted])
+]);
+el('seriesCsv').onclick=()=>download('lift-series.csv',[
+  ['start_s','end_s_exclusive','start_utc','total','skier','snowboarder','adaptive','unknown','patrol_cue'],
+  ...bins().map(r=>[r.start,r.start+10,timestamp(r.start),r.total,r.skier,r.snowboarder,r.adaptive,r.unknown,r.patrol])
+]);
+el('truthCsv').onclick=()=>download('lift-sample-truth.csv',[
+  ['seconds','seat_y_px','equipment','patrol'],...truth.map(e=>[e.time,e.y,e.equipment,e.patrol])
+]);
+reset('sample');sampleStep(true);
+</script>
+</html>
