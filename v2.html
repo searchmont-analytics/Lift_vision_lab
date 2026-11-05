@@ -9,6 +9,7 @@ section{background:white;padding:1rem;margin:1rem 0;border-radius:.5rem}
 label{display:inline-block;margin:.3rem .7rem .3rem 0}button,input,select{font:inherit}
 canvas{display:block;width:100%;height:auto;background:#dce8f0}
 td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
+.swatch{display:inline-block;width:1em;height:1em;border:1px solid #526472;border-radius:.2em;margin-right:.4em;vertical-align:middle}
 </style>
 <a href="./">Synthetic demo</a>
 <h1>Lift Vision Lab V2</h1>
@@ -35,9 +36,10 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 <section>
 <h2>Counted people</h2>
 <p>Click a timestamp to review its sampled frame. A long occlusion or re-entry can create a second track for the same person. A person detection can be a rider or a bystander. Review the events before using the count. Equipment and patrol are unclassified.</p>
+<p>Coat color is estimated from the upper body across several frames. Use the menu to correct it after reviewing the clip.</p>
 <label>Manual reference count <input id="manual" type="number" min="0" step="1"></label>
 <strong id="total">0 events</strong><button id="csv" disabled>Export CSV</button>
-<table><thead><tr><th>Clip time (s)</th><th>Track</th><th>Confidence</th><th>Review</th></tr></thead><tbody id="rows"></tbody></table>
+<table><thead><tr><th>Clip time (s)</th><th>Track</th><th>Confidence</th><th>Coat color</th><th>Review</th></tr></thead><tbody id="rows"></tbody></table>
 </section>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
@@ -48,6 +50,44 @@ const video=el('video'), canvas=el('preview'), ctx=canvas.getContext('2d');
 const inputs=['sample','file','mode','direction','gate','from','to'].map(el);
 let objectUrl, model, region=[0,0,1,1], drag, events=[], running=false, cancel=false, reviewing=false;
 const step=.2;
+const coatPalette={
+  unknown:'transparent', black:'#20242b', gray:'#808080', white:'#fff',
+  red:'#c32c37', orange:'#ed7b27', yellow:'#efca31', green:'#408447',
+  teal:'#258989', blue:'#3264bc', purple:'#7546a6', pink:'#d65791', brown:'#805339'
+};
+
+function pixelColor(r,g,b){
+  const high=Math.max(r,g,b),low=Math.min(r,g,b),range=high-low;
+  if(high<52)return 'black';
+  if(range/high<.23)return high>=200?'white':'gray';
+  let hue;
+  if(high===r)hue=60*(g-b)/range;
+  else if(high===g)hue=120+60*(b-r)/range;
+  else hue=240+60*(r-g)/range;
+  if(hue<0)hue+=360;
+  if(hue<16||hue>=345)return 'red';
+  if(hue<43)return high<145?'brown':'orange';
+  if(hue<68)return 'yellow';
+  if(hue<165)return 'green';
+  if(hue<195)return 'teal';
+  if(hue<255)return 'blue';
+  if(hue<305)return 'purple';
+  return 'pink';
+}
+
+function coatInFrame([x,y,w,h]){
+  const left=Math.max(0,Math.ceil(x+w*.30)),right=Math.min(canvas.width,Math.floor(x+w*.70));
+  const top=Math.max(0,Math.ceil(y+h*.28)),bottom=Math.min(canvas.height,Math.floor(y+h*.55));
+  if(right-left<4||bottom-top<4)return 'unknown';
+  const data=ctx.getImageData(left,top,right-left,bottom-top).data;
+  const votes=new Map();
+  for(let i=0;i<data.length;i+=4){
+    const color=pixelColor(data[i],data[i+1],data[i+2]);
+    votes.set(color,(votes.get(color)||0)+1);
+  }
+  for(const [color,count] of votes)if(count>data.length/8)return color;
+  return 'unknown';
+}
 const status=message=>{el('status').textContent=message;};
 function configuration(){
   const d=Number(el('direction').value), gate=el('gate').valueAsNumber/100;
@@ -165,6 +205,18 @@ function append(event){
   row.insertCell().append(button);
   row.insertCell().textContent=event.id;
   row.insertCell().textContent=Math.round(event.score*100)+'%';
+  const swatch=document.createElement('span'), coat=document.createElement('select');
+  swatch.className='swatch';swatch.setAttribute('aria-hidden','true');
+  coat.setAttribute('aria-label','Coat color for track '+event.id);
+  coat.title='Estimated: '+event.coatColorRaw;
+  for(const color of Object.keys(coatPalette))coat.add(new Option(color,color));
+  coat.value=event.coatColor;
+  swatch.style.backgroundColor=coatPalette[coat.value];
+  coat.onchange=()=>{
+    event.coatColor=coat.value;
+    swatch.style.backgroundColor=coatPalette[coat.value];
+  };
+  row.insertCell().append(swatch,coat);
   const review=document.createElement('input');
   review.type='checkbox';review.checked=true;review.setAttribute('aria-label','Accept track '+event.id);
   review.onchange=()=>{event.accepted=review.checked;summary();};
@@ -186,6 +238,10 @@ function makeTracker(config){
     for(const {track,d} of pairs){
       if(matched.has(track)||used.has(d))continue;
       matched.add(track);used.add(d);track.hits++;d.id=track.id;
+      if(!track.counted){
+        track.coats.push(d.coat);
+        if(track.coats.length>5)track.coats.shift();
+      }
       const before=signed(track),after=signed(d),dt=t-track.t;
       if(after<-.015)track.armed=true;
       if(track.armed&&before<0&&after>=0)track.cross=t-dt*after/(after-before);
@@ -193,7 +249,10 @@ function makeTracker(config){
       const eventTime=config.mode==='appearance'?track.firstTime:track.cross;
       const eligible=config.mode==='appearance'||after>=.01;
       if(eligible&&eventTime!==null&&track.hits>=3&&!track.counted){
-        crossings.push({id:track.id,time:eventTime,frameTime:t,score:d.score,accepted:true});
+        const color=track.coats.find(value=>value!=='unknown'&&
+          track.coats.filter(vote=>vote===value).length>track.coats.length/2)||'unknown';
+        crossings.push({id:track.id,time:eventTime,frameTime:t,score:d.score,accepted:true,
+          coatColorRaw:color,coatColor:color});
         track.counted=true;
       }
       track.vx=.4*track.vx+.6*(d.x-track.x)/dt;
@@ -202,7 +261,7 @@ function makeTracker(config){
     }
     for(const d of detections)if(!used.has(d)){
       d.id=nextId++;
-      tracks.push({...d,t,firstTime:t,hits:1,vx:0,vy:0,armed:signed(d)<-.015,cross:null,counted:false});
+      tracks.push({...d,t,firstTime:t,hits:1,vx:0,vy:0,armed:signed(d)<-.015,cross:null,counted:false,coats:[d.coat]});
     }
     return crossings;
   };
@@ -231,6 +290,7 @@ el('run').onclick=async()=>{
       const detections=predictions.filter(p=>p.class==='person').map(p=>({
         ...p,x:(p.bbox[0]+p.bbox[2]/2)/canvas.width,y:(p.bbox[1]+p.bbox[3]/2)/canvas.height
       })).filter(p=>p.x>=l&&p.x<=r&&p.y>=top&&p.y<=b);
+      for(const detection of detections)detection.coat=coatInFrame(detection.bbox);
       for(const event of update(detections,t))append({...event,config,detections});
       paint(config,detections);
       status('Analyzing '+t.toFixed(1)+' / '+end.toFixed(1)+' s · '+detections.length+' people in region');
@@ -240,8 +300,8 @@ el('run').onclick=async()=>{
   finally{running=false;locks();}
 };
 el('csv').onclick=()=>{
-  const body=['track,clip_seconds,sampled_frame_seconds,confidence,accepted,count_mode',
-    ...events.map(e=>[e.id,e.time.toFixed(3),e.frameTime.toFixed(3),e.score.toFixed(3),e.accepted,e.config.mode].join(','))].join('\r\n');
+  const body=['track,clip_seconds,sampled_frame_seconds,confidence,accepted,count_mode,coat_color_raw,coat_color',
+    ...events.map(e=>[e.id,e.time.toFixed(3),e.frameTime.toFixed(3),e.score.toFixed(3),e.accepted,e.config.mode,e.coatColorRaw,e.coatColor].join(','))].join('\r\n');
   const url=URL.createObjectURL(new Blob([body],{type:'text/csv'}));
   const link=document.createElement('a');link.href=url;link.download='lift-v2-events.csv';link.click();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
