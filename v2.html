@@ -12,8 +12,14 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 </style>
 <a href="./">Synthetic demo</a>
 <h1>Lift Vision Lab V2</h1>
-<p>Run a pretrained person detector on a local chairlift clip. The browser downloads the model. It processes the selected video on your device.</p>
+<p>Run a pretrained person detector on a sample chairlift clip or your own video. The browser downloads the model and processes the selected video on your device.</p>
 <section>
+<label>Sample clip <select id="sample">
+<option value="">Choose a sample</option>
+<option value="short_8_skiers_chairlift_unload_station.mp4" data-reference="8">Short · 8 skiers</option>
+<option value="medium_15_skiers_chairlift_unload_station.mp4" data-reference="15">Medium · 15 skiers</option>
+<option value="medium_23_skiers_chairlift_unload_station.mp4" data-reference="23">Medium · 23 skiers</option>
+</select></label>
 <label>Local video <input id="file" type="file" accept="video/*"></label><br>
 <label>Count <select id="mode"><option value="appearance">Each person in view</option><option value="gate">Gate crossings</option></select></label>
 <span id="gateControls" hidden><label>Direction <select id="direction"><option value="1">Left to right</option><option value="-1">Right to left</option><option value="2">Top to bottom</option><option value="-2">Bottom to top</option></select></label>
@@ -22,7 +28,7 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 <label>End (s) <input id="to" type="number" min="0" placeholder="End of clip" step=".1"></label>
 <p>Choose one continuous shot. Each person in view counts a track once after three detections. Optionally drag a rectangle around the off-ramp to exclude people outside it, or click the preview to reset the region.</p>
 <button id="run" disabled>Analyze clip</button><button id="stop" disabled>Stop</button>
-<p id="status" role="status">Choose a local video to start.</p>
+<p id="status" role="status">Choose a sample or local video to start.</p>
 </section>
 <canvas id="preview" width="800" height="450" aria-label="Frame, detected people, and count gate"></canvas>
 <video id="video" muted playsinline hidden></video>
@@ -39,7 +45,7 @@ td,th{padding:.3rem .7rem;text-align:left} button{margin:.25rem}
 'use strict';
 const el=id=>document.getElementById(id);
 const video=el('video'), canvas=el('preview'), ctx=canvas.getContext('2d');
-const inputs=['file','mode','direction','gate','from','to'].map(el);
+const inputs=['sample','file','mode','direction','gate','from','to'].map(el);
 let objectUrl, model, region=[0,0,1,1], drag, events=[], running=false, cancel=false, reviewing=false;
 const step=.2;
 const status=message=>{el('status').textContent=message;};
@@ -87,12 +93,31 @@ function locks(){
   el('stop').disabled=!running;
 }
 function clearEvents(){events=[];el('rows').replaceChildren();summary();}
+function openClip(url,reference=''){
+  region=[0,0,1,1];clearEvents();el('run').disabled=true;
+  el('manual').value=reference;summary();
+  status('Opening video…');
+  video.src=url;
+}
 el('file').onchange=()=>{
   const file=el('file').files[0];if(!file)return;
+  el('sample').value='';
   if(objectUrl)URL.revokeObjectURL(objectUrl);
-  region=[0,0,1,1];clearEvents();el('run').disabled=true;
-  status('Opening local video…');
-  video.src=objectUrl=URL.createObjectURL(file);
+  objectUrl=URL.createObjectURL(file);
+  openClip(objectUrl);
+};
+el('sample').onchange=()=>{
+  const option=el('sample').selectedOptions[0];
+  if(!option.value){
+    video.removeAttribute('src');video.load();
+    clearEvents();el('manual').value='';summary();locks();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    status('Choose a sample or local video to start.');
+    return;
+  }
+  el('file').value='';
+  if(objectUrl){URL.revokeObjectURL(objectUrl);objectUrl=null;}
+  openClip('./samples/'+option.value,option.dataset.reference);
 };
 video.onloadeddata=()=>{
   const scale=Math.min(1,960/Math.max(video.videoWidth,video.videoHeight));
